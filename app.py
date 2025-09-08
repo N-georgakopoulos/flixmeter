@@ -7,6 +7,10 @@ from datetime import datetime
 import os
 import traceback
 import io
+import requests
+import tempfile
+import gc
+from urllib.parse import urljoin
 
 app = Flask(__name__)
 CORS(app)
@@ -14,42 +18,80 @@ CORS(app)
 # Enable debug mode for better error messages
 app.config['DEBUG'] = True
 
-class RuntimeCalculator:
+# GitHub release URLs
+GITHUB_BASE_URL = "https://github.com/N-georgakopoulos/flixmeter/releases/download/v1.0/"
+CSV_FILES = {
+    'moviedata': 'moviedata.csv',
+    'alternatetitles': 'alternatetitles.csv',
+    'ratings': 'ratings_top100k.csv'
+}
+
+class ChunkedRuntimeCalculator:
     def __init__(self):
-        self.moviedata_df = None
-        self.alttitles_df = None
+        self.chunk_size = 10000  # Process 10k rows at a time
+        self.temp_dir = None
         self.loaded = False
+        self.moviedata_file = None
+        self.alttitles_file = None
         
-    def load_data(self):
-        """Load all necessary data files"""
+    def download_file(self, filename, url):
+        """Download a file from GitHub releases with streaming"""
         try:
-            # Check if files exist
-            files_to_check = ['moviedata.csv', 'alternatetitles.csv']
-            missing_files = []
+            print(f"Downloading {filename} from {url}...")
+            response = requests.get(url, stream=True)
+            response.raise_for_status()
             
-            for file in files_to_check:
-                if not os.path.exists(file):
-                    missing_files.append(file)
+            # Create temp file
+            temp_file = tempfile.NamedTemporaryFile(mode='wb', delete=False, suffix='.csv')
             
-            if missing_files:
-                return False, f"Missing files: {missing_files}"
-                
-            # Load the data
-            print("Loading moviedata.csv...")
-            self.moviedata_df = pd.read_csv('moviedata.csv', low_memory=False)
+            # Download in chunks to avoid memory issues
+            for chunk in response.iter_content(chunk_size=8192):
+                if chunk:
+                    temp_file.write(chunk)
             
-            print("Loading alternatetitles.csv...")
-            self.alttitles_df = pd.read_csv('alternatetitles.csv', low_memory=False)
-            
-            self.loaded = True
-            
-            print(f"Successfully loaded {len(self.moviedata_df)} movies, {len(self.alttitles_df)} alt titles")
-            return True, f"Loaded {len(self.moviedata_df)} movies, {len(self.alttitles_df)} alt titles"
+            temp_file.close()
+            print(f"✅ Downloaded {filename} to {temp_file.name}")
+            return temp_file.name
             
         except Exception as e:
-            print(f"Error loading data: {str(e)}")
+            print(f"❌ Error downloading {filename}: {str(e)}")
+            return None
+        
+    def load_data(self):
+        """Download and prepare CSV files for chunked reading"""
+        try:
+            # Create temp directory if it doesn't exist
+            if self.temp_dir is None:
+                self.temp_dir = tempfile.mkdtemp()
+                print(f"Created temp directory: {self.temp_dir}")
+            
+            # Download required files
+            moviedata_url = urljoin(GITHUB_BASE_URL, CSV_FILES['moviedata'])
+            alttitles_url = urljoin(GITHUB_BASE_URL, CSV_FILES['alternatetitles'])
+            
+            self.moviedata_file = self.download_file('moviedata.csv', moviedata_url)
+            self.alttitles_file = self.download_file('alternatetitles.csv', alttitles_url)
+            
+            if not self.moviedata_file or not self.alttitles_file:
+                return False, "Failed to download required CSV files"
+            
+            # Test that we can read the headers
+            try:
+                moviedata_sample = pd.read_csv(self.moviedata_file, nrows=1)
+                alttitles_sample = pd.read_csv(self.alttitles_file, nrows=1)
+                print(f"Moviedata columns: {list(moviedata_sample.columns)}")
+                print(f"Alt titles columns: {list(alttitles_sample.columns)}")
+            except Exception as e:
+                return False, f"Error reading CSV headers: {str(e)}"
+            
+            self.loaded = True
+            print("✅ Data files ready for chunked processing")
+            return True, "Data files downloaded and ready"
+            
+        except Exception as e:
+            print(f"Error in load_data: {str(e)}")
             print(traceback.format_exc())
-            return False, f"Error loading data: {str(e)}"
+            return False, f"Error preparing data: {str(e)}"
 
     def clean_title_for_matching(self, title):
         """Clean title for better matching"""
@@ -92,64 +134,92 @@ class RuntimeCalculator:
         
         return unique_variations
 
-    def find_runtime_enhanced(self, title_variations):
-        """Enhanced runtime finding with multiple strategies"""
+    def find_runtime_chunked(self, title_variations):
+        """Find runtime using chunked reading to minimize memory usage"""
         
         if not self.loaded:
             return None, None, "Database not loaded"
             
-        for variation in title_variations:
-            if not variation:
-                continue
+        # Convert variations to lowercase for faster comparison
+        variations_lower = [v.lower() for v in title_variations if v]
+        if not variations_lower:
+            return None, None, "No valid variations"
+            
+        try:
+            # Strategy 1: Search in moviedata chunks
+            moviedata_reader = pd.read_csv(self.moviedata_file, chunksize=self.chunk_size, low_memory=False)
+            
+            for chunk_idx, chunk in enumerate(moviedata_reader):
+                # Clean up memory
+                if chunk_idx > 0 and chunk_idx % 10 == 0:
+                    gc.collect()
                 
-            try:
-                # Strategy 1: Direct match in moviedata (primary title)
-                if 'primaryTitle' in self.moviedata_df.columns:
-                    match = self.moviedata_df[self.moviedata_df['primaryTitle'].str.lower() == variation.lower()]
-                    if not match.empty:
-                        runtime = match.iloc[0]['runtimeMinutes']
-                        if pd.notna(runtime) and str(runtime).strip() not in ['', '\\N', 'N/A']:
-                            try:
-                                runtime_int = int(float(runtime))
-                                return runtime_int, match.iloc[0]['tconst'], f"Direct match (primary): '{variation}'"
-                            except:
-                                continue
-                
-                # Strategy 2: Direct match in moviedata (original title)  
-                if 'originalTitle' in self.moviedata_df.columns:
-                    match = self.moviedata_df[self.moviedata_df['originalTitle'].str.lower() == variation.lower()]
-                    if not match.empty:
-                        runtime = match.iloc[0]['runtimeMinutes']
-                        if pd.notna(runtime) and str(runtime).strip() not in ['', '\\N', 'N/A']:
-                            try:
-                                runtime_int = int(float(runtime))
-                                return runtime_int, match.iloc[0]['tconst'], f"Direct match (original): '{variation}'"
-                            except:
-                                continue
-                
-                # Strategy 3: Alternative titles exact match
-                if 'title' in self.alttitles_df.columns and 'titleId' in self.alttitles_df.columns:
-                    alt_match = self.alttitles_df[self.alttitles_df['title'].str.lower() == variation.lower()]
-                    if not alt_match.empty:
-                        tconst = alt_match.iloc[0]['titleId']
-                        movie_match = self.moviedata_df[self.moviedata_df['tconst'] == tconst]
-                        if not movie_match.empty:
-                            runtime = movie_match.iloc[0]['runtimeMinutes']
+                # Check primary title
+                if 'primaryTitle' in chunk.columns:
+                    chunk['primaryTitle_lower'] = chunk['primaryTitle'].astype(str).str.lower()
+                    for idx, var in enumerate(variations_lower):
+                        match = chunk[chunk['primaryTitle_lower'] == var]
+                        if not match.empty:
+                            runtime = match.iloc[0]['runtimeMinutes']
                             if pd.notna(runtime) and str(runtime).strip() not in ['', '\\N', 'N/A']:
                                 try:
                                     runtime_int = int(float(runtime))
-                                    return runtime_int, tconst, f"Alt title exact: '{variation}'"
+                                    return runtime_int, match.iloc[0]['tconst'], f"Primary title match: '{title_variations[idx]}'"
                                 except:
                                     continue
                 
-            except Exception as e:
-                print(f"Error processing variation '{variation}': {str(e)}")
-                continue
-        
-        return None, None, "Not found"
+                # Check original title
+                if 'originalTitle' in chunk.columns:
+                    chunk['originalTitle_lower'] = chunk['originalTitle'].astype(str).str.lower()
+                    for idx, var in enumerate(variations_lower):
+                        match = chunk[chunk['originalTitle_lower'] == var]
+                        if not match.empty:
+                            runtime = match.iloc[0]['runtimeMinutes']
+                            if pd.notna(runtime) and str(runtime).strip() not in ['', '\\N', 'N/A']:
+                                try:
+                                    runtime_int = int(float(runtime))
+                                    return runtime_int, match.iloc[0]['tconst'], f"Original title match: '{title_variations[idx]}'"
+                                except:
+                                    continue
+            
+            # Strategy 2: Search in alternate titles chunks
+            alttitles_reader = pd.read_csv(self.alttitles_file, chunksize=self.chunk_size, low_memory=False)
+            
+            for chunk_idx, alt_chunk in enumerate(alttitles_reader):
+                if chunk_idx > 0 and chunk_idx % 10 == 0:
+                    gc.collect()
+                
+                if 'title' in alt_chunk.columns and 'titleId' in alt_chunk.columns:
+                    alt_chunk['title_lower'] = alt_chunk['title'].astype(str).str.lower()
+                    
+                    for idx, var in enumerate(variations_lower):
+                        alt_match = alt_chunk[alt_chunk['title_lower'] == var]
+                        if not alt_match.empty:
+                            tconst = alt_match.iloc[0]['titleId']
+                            
+                            # Now find this tconst in moviedata
+                            moviedata_reader2 = pd.read_csv(self.moviedata_file, chunksize=self.chunk_size, low_memory=False)
+                            
+                            for movie_chunk in moviedata_reader2:
+                                movie_match = movie_chunk[movie_chunk['tconst'] == tconst]
+                                if not movie_match.empty:
+                                    runtime = movie_match.iloc[0]['runtimeMinutes']
+                                    if pd.notna(runtime) and str(runtime).strip() not in ['', '\\N', 'N/A']:
+                                        try:
+                                            runtime_int = int(float(runtime))
+                                            return runtime_int, tconst, f"Alt title match: '{title_variations[idx]}'"
+                                        except:
+                                            continue
+                                    break  # Found the tconst, no need to continue
+            
+            return None, None, "Not found after chunked search"
+            
+        except Exception as e:
+            print(f"Error in chunked search: {str(e)}")
+            return None, None, f"Search error: {str(e)}"
 
     def analyze_watch_history(self, watchhistory_data, limit=None):
-        """Analyze watch history and sum runtimes with enhanced matching"""
+        """Analyze watch history using chunked processing"""
         
         total_runtime = 0
         found_entries = []
@@ -165,40 +235,53 @@ class RuntimeCalculator:
         if limit:
             watchhistory_df = watchhistory_df.head(limit)
         
-        for idx, row in watchhistory_df.iterrows():
-            title = row.get('Title', row.get('title', ''))
-            date = row.get('Date', row.get('date', ''))
+        # Process in smaller batches to manage memory
+        batch_size = 50  # Process 50 titles at a time
+        total_rows = len(watchhistory_df)
+        
+        for batch_start in range(0, total_rows, batch_size):
+            batch_end = min(batch_start + batch_size, total_rows)
+            batch_df = watchhistory_df.iloc[batch_start:batch_end]
             
-            title_str = str(title) if not pd.isna(title) else 'nan'
+            print(f"Processing batch {batch_start//batch_size + 1}/{(total_rows-1)//batch_size + 1} ({batch_start+1}-{batch_end}/{total_rows})")
             
-            if title_str in ['nan', 'None', ''] or title_str.strip() == '':
-                not_found_entries.append({
-                    'original_title': title_str,
-                    'variations_tried': '',
-                    'reason': 'Empty/Invalid title',
-                    'date': str(date) if not pd.isna(date) else ''
-                })
-                continue
+            for idx, row in batch_df.iterrows():
+                title = row.get('Title', row.get('title', ''))
+                date = row.get('Date', row.get('date', ''))
+                
+                title_str = str(title) if not pd.isna(title) else 'nan'
+                
+                if title_str in ['nan', 'None', ''] or title_str.strip() == '':
+                    not_found_entries.append({
+                        'original_title': title_str,
+                        'variations_tried': '',
+                        'reason': 'Empty/Invalid title',
+                        'date': str(date) if not pd.isna(date) else ''
+                    })
+                    continue
+                
+                variations = self.extract_variations(title_str)
+                runtime, tconst, match_info = self.find_runtime_chunked(variations)
+                
+                if runtime:
+                    total_runtime += runtime
+                    found_entries.append({
+                        'original_title': title_str,
+                        'matched_via': match_info,
+                        'runtime': runtime,
+                        'tconst': tconst,
+                        'date': str(date) if not pd.isna(date) else ''
+                    })
+                else:
+                    not_found_entries.append({
+                        'original_title': title_str,
+                        'variations_tried': str(variations),
+                        'reason': 'No matches found in chunked search',
+                        'date': str(date) if not pd.isna(date) else ''
+                    })
             
-            variations = self.extract_variations(title_str)
-            runtime, tconst, match_info = self.find_runtime_enhanced(variations)
-            
-            if runtime:
-                total_runtime += runtime
-                found_entries.append({
-                    'original_title': title_str,
-                    'matched_via': match_info,
-                    'runtime': runtime,
-                    'tconst': tconst,
-                    'date': str(date) if not pd.isna(date) else ''
-                })
-            else:
-                not_found_entries.append({
-                    'original_title': title_str,
-                    'variations_tried': str(variations),
-                    'reason': 'No matches found in any strategy',
-                    'date': str(date) if not pd.isna(date) else ''
-                })
+            # Force garbage collection after each batch
+            gc.collect()
         
         return {
             'total_runtime': total_runtime,
@@ -208,15 +291,30 @@ class RuntimeCalculator:
             'not_found_entries': not_found_entries
         }
 
+    def cleanup(self):
+        """Clean up temporary files"""
+        try:
+            if self.moviedata_file and os.path.exists(self.moviedata_file):
+                os.unlink(self.moviedata_file)
+            if self.alttitles_file and os.path.exists(self.alttitles_file):
+                os.unlink(self.alttitles_file)
+            if self.temp_dir and os.path.exists(self.temp_dir):
+                os.rmdir(self.temp_dir)
+            print("✅ Cleaned up temporary files")
+        except Exception as e:
+            print(f"Warning: Could not clean up temp files: {str(e)}")
+
 @app.route('/')
 def index():
     """API status endpoint"""
     return jsonify({
-        "status": "Movie Runtime Calculator API",
-        "version": "1.0",
+        "status": "Memory-Optimized Movie Runtime Calculator API",
+        "version": "2.0",
+        "features": ["Chunked CSV processing", "GitHub releases integration", "Memory-efficient"],
         "endpoints": {
             "POST /api/calculate": "Calculate total runtime from watch history CSV",
-            "GET /api/status": "Check if database is loaded"
+            "GET /api/status": "Check if database is loaded",
+            "POST /api/reload": "Force reload data from GitHub"
         }
     })
 
@@ -235,8 +333,28 @@ def api_status():
     return jsonify({
         "success": True,
         "loaded": True,
-        "message": f"Database loaded: {len(calculator.moviedata_df)} movies, {len(calculator.alttitles_df)} alt titles"
+        "message": "Data files ready for chunked processing",
+        "chunk_size": calculator.chunk_size
     })
+
+@app.route('/api/reload', methods=['POST'])
+def reload_data():
+    """Force reload data from GitHub"""
+    try:
+        calculator.cleanup()  # Clean up old files
+        calculator.loaded = False
+        success, message = calculator.load_data()
+        
+        return jsonify({
+            "success": success,
+            "message": message
+        }), 200 if success else 500
+        
+    except Exception as e:
+        return jsonify({
+            "success": False,
+            "error": f"Reload error: {str(e)}"
+        }), 500
 
 @app.route('/api/calculate', methods=['POST'])
 def calculate_runtime():
@@ -330,6 +448,7 @@ def calculate_runtime():
                 limit = None
         
         # Process the watch history
+        print(f"Starting analysis of {len(watchhistory_df)} titles...")
         results = calculator.analyze_watch_history(watchhistory_df, limit=limit)
         
         # Add some calculated fields for convenience
@@ -340,10 +459,13 @@ def calculate_runtime():
         results['total_days'] = results['total_runtime'] / (60 * 24)
         results['avg_runtime'] = results['total_runtime'] / results['found_count'] if results['found_count'] > 0 else 0
         
+        # Force garbage collection
+        gc.collect()
+        
         return jsonify({
             "success": True,
             "results": results,
-            "message": f"Processed {total_count} titles, found {results['found_count']} matches"
+            "message": f"Processed {total_count} titles, found {results['found_count']} matches using chunked processing"
         })
         
     except Exception as e:
@@ -353,18 +475,12 @@ def calculate_runtime():
             "traceback": traceback.format_exc()
         }), 500
 
-# Initialize calculator and try to load data on startup
-calculator = RuntimeCalculator()
+# Initialize calculator
+calculator = ChunkedRuntimeCalculator()
 
-# Try to load data on startup
-try:
-    success, message = calculator.load_data()
-    if success:
-        print(f"✅ Startup: {message}")
-    else:
-        print(f"⚠️ Startup warning: {message}")
-except Exception as e:
-    print(f"❌ Startup error: {str(e)}")
+# Clean up on exit
+import atexit
+atexit.register(calculator.cleanup)
 
 if __name__ == '__main__':
     port = int(os.environ.get('PORT', 5000))

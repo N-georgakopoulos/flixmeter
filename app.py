@@ -339,7 +339,30 @@ def api_status():
         "message": "Data files ready for chunked processing",
         "chunk_size": calculator.chunk_size
     })
+@app.route("/api/calculate_chunk", methods=["POST"])
+def calculate_chunk():
+    try:
+        file = request.files["chunk"]
+        chunk_index = int(request.form.get("chunk_index", 0))
+        total_chunks = int(request.form.get("total_chunks", 1))
 
+        # parse the chunk CSV
+        df = pd.read_csv(file)
+
+        # run your analysis logic on this chunk only
+        results = analyze_chunk(df)  # <- you already have calculation logic, reuse it
+
+        return jsonify({
+            "success": True,
+            "chunk_index": chunk_index,
+            "total_chunks": total_chunks,
+            "total_hours": results["total_hours"],
+            "found_count": results["found_count"],
+            "total_count": results["total_count"],
+            "total_runtime": results["total_runtime"]
+        })
+    except Exception as e:
+        return jsonify({"success": False, "error": str(e)}), 500
 @app.route('/api/reload', methods=['POST'])
 def reload_data():
     """Force reload data from GitHub"""

@@ -362,6 +362,8 @@ def calculate_chunk():
             "total_runtime": results["total_runtime"]
         })
     except Exception as e:
+        print("Error in calculate_chunk:", e)
+        traceback.print_exc()
         return jsonify({"success": False, "error": str(e)}), 500
 @app.route('/api/reload', methods=['POST'])
 def reload_data():

@@ -147,7 +147,7 @@ def analyze_watch_history(watchhistory_df, moviedata_df, alttitles_df):
     
     print(f"\nProcessing {len(watchhistory_df)} titles...")
     
-    for idx, row in watchhistory_df.iterrows():
+    for idx, row in watchhistory_df.head(20).iterrows():
         title = row['Title']
         date = row['Date']
         
@@ -246,7 +246,7 @@ def save_results(results):
     found_count = results['found_count']
     not_found_count = results['not_found_count']
     total_count = found_count + not_found_count
-    search_duration = results['search_duration']
+    
     
     # Strategy breakdown
     strategy_counts = {}
@@ -261,8 +261,7 @@ def save_results(results):
     
     # Basic metrics
     summary_data.extend([
-        ['Search Duration (seconds)', f'{search_duration:.2f}'],
-        ['Processing Speed (titles/sec)', f'{total_count/search_duration:.1f}'],
+
         ['Total Titles Processed', total_count],
         ['Found Count', found_count],
         ['Not Found Count', not_found_count],

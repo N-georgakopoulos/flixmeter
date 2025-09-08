@@ -13,8 +13,11 @@ import gc
 from urllib.parse import urljoin
 
 app = Flask(__name__)
-CORS(app)
-
+# Apply CORS to ALL routes under /api/*
+CORS(app, resources={r"/api/*": {"origins": "*"}},
+     supports_credentials=True,
+     allow_headers=["Content-Type", "Authorization", "X-Requested-With"],
+     methods=["GET", "POST", "OPTIONS"])
 # Enable debug mode for better error messages
 app.config['DEBUG'] = True
 
@@ -485,3 +488,4 @@ atexit.register(calculator.cleanup)
 if __name__ == '__main__':
     port = int(os.environ.get('PORT', 5000))
     app.run(host='0.0.0.0', port=port, debug=True)
+
